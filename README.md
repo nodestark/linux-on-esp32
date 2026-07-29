@@ -55,3 +55,5 @@ idf.py build
 python3 -m http.server 8000
 ```
 then open `http://localhost:8000/index.html` (must run from the repo root, since it fetches `data/*` as a relative path).
+
+![browser port running](browser-port-screenshot.jpg)

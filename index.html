@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="pt-BR">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>ulinux-esp32 — RISC-V Linux in the browser</title>
@@ -46,20 +46,20 @@
 </head>
 <body>
 
-<h1>ulinux-esp32 — porte para o navegador</h1>
-<div class="sub">RV32IMAFDC + virtio-mmio, mesma máquina do firmware ESP32, rodando 100% em JavaScript no navegador.</div>
+<h1>ulinux-esp32 — browser port</h1>
+<div class="sub">RV32IMAFDC + virtio-mmio, the same machine as the ESP32 firmware, running 100% in JavaScript in the browser.</div>
 
 <div id="wrap">
 	<div class="panel">
-		<span id="status">carregando…</span>
+		<span id="status">loading…</span>
 		<span style="flex:1"></span>
 		<div class="gpio"><span class="led" id="led0"></span>gpio0<button id="btn0">toggle</button></div>
 		<div class="gpio"><span class="led" id="led1"></span>gpio1<button id="btn1">toggle</button></div>
-		<button id="btnReset">reiniciar</button>
+		<button id="btnReset">reset</button>
 	</div>
 
 	<div id="term" tabindex="0"></div>
-	<div id="hint">clique no terminal para focar e digitar. console é o hvc0 do guest (sem eco local — quem ecoa é o próprio kernel).</div>
+	<div id="hint">click the terminal to focus and type. console is the guest's hvc0 (no local echo — the kernel itself echoes back).</div>
 </div>
 
 <script>
@@ -1489,7 +1489,7 @@ const host = {
 		return new Uint8Array(inputQueue.splice(0, 16));
 	},
 	exit: (code) => {
-		statusEl.textContent = 'guest pediu poweroff/reboot (código ' + code + ') — recarregue a página para reiniciar';
+		statusEl.textContent = 'guest requested poweroff/reboot (code ' + code + ') — reload the page to restart';
 		running = false;
 	},
 };
@@ -1531,7 +1531,7 @@ function frame() {
 	setTimeout(frame, 0); /*setTimeout instead of requestAnimationFrame: keeps running in background tabs, where rAF gets throttled/paused*/
 }
 
-statusEl.textContent = 'baixando imagens (bbl32, kernel, rootfs, dtb)…';
+statusEl.textContent = 'downloading images (bbl32, kernel, rootfs, dtb)…';
 
 Promise.all([
 	fetch('data/bbl32.bin').then(r => r.arrayBuffer()),
@@ -1549,12 +1549,12 @@ Promise.all([
 	boot(assets, host);
 	updateGpioLeds();
 
-	statusEl.textContent = 'rodando — RV32IMAFDC + virtio-mmio (console, blk, gpio)';
+	statusEl.textContent = 'running — RV32IMAFDC + virtio-mmio (console, blk, gpio)';
 	running = true;
 	termEl.focus();
 	frame();
 }).catch(err => {
-	statusEl.textContent = 'erro ao carregar imagens: ' + err.message;
+	statusEl.textContent = 'error loading images: ' + err.message;
 });
 </script>
 </body>
