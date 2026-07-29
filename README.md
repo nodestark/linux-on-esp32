@@ -39,7 +39,7 @@ Same RV32IMAFDC + virtio-mmio core, in three variants:
 
 - **`machine-esp32-s3n16r8/`** — real hardware firmware (ESP32-S3, 16MB flash), covered above. Guest images live in a LittleFS partition; virtio-net bridges to real WiFi (`esp_wifi_internal_tx`/`esp_wifi_internal_rxcb`), so the guest gets real network access. This is the variant shown in the YouTube video above.
 - **`machine-esp32-linux/`** — same core, built for ESP-IDF's `linux` target (compiles to a native host binary, no hardware needed). The CPU decoder is split out into `cpu.c`/`cpu.h`, and guest RAM is streamed through an LRU-windowed cache (`data/memory.bin`) instead of living fully resident. Used for fast local development and debugging. virtio-net exists but isn't bridged to a real interface yet (queue is drained, packets aren't forwarded anywhere).
-- **`machine-web/`** — `ulinux-web.html` + `data/` (own copy of the 4 guest images): the same emulator ported to JavaScript, running 100% client-side in a browser. Images are `fetch()`ed at load time, so it needs to be served over HTTP (GitHub Pages, `python3 -m http.server`, etc.) — `file://` is blocked by CORS.
+- **`index.html`** — the same emulator ported to JavaScript, running 100% client-side in a browser. Fetches the guest images from `data/` at load time, so it needs to be served over HTTP (GitHub Pages, `python3 -m http.server`, etc.) — `file://` is blocked by CORS. Live at **https://nodestark.github.io/esp32-running-linux/**.
 - **`data/`** — the four guest images shared by all three variants: `bbl32.bin` (bootloader), `Image` (kernel), `riscv_emulator.dtb`, `rootfs.ext2`.
 
 ### Running machine-esp32-linux (native, no hardware)
@@ -50,9 +50,8 @@ idf.py build
 ./build/ulinux-esp32.elf   # run from inside machine-esp32-linux/, it reads ../data/ as a relative path
 ```
 
-### Running machine-web (browser)
-Needs to be served over HTTP (fetches `data/*` at load time):
+### Running the browser version locally
 ```
-cd machine-web && python3 -m http.server 8000
+python3 -m http.server 8000
 ```
-then open `http://localhost:8000/ulinux-web.html`. Also works as-is on GitHub Pages.
+then open `http://localhost:8000/index.html` (must run from the repo root, since it fetches `data/*` as a relative path).
