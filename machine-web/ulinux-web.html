@@ -1,0 +1,1561 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>ulinux-esp32 — RISC-V Linux in the browser</title>
+<style>
+	:root { color-scheme: dark; }
+	* { box-sizing: border-box; }
+	body {
+		margin: 0; padding: 16px; min-height: 100vh;
+		background: #10131a; color: #c9d1d9;
+		font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+		display: flex; flex-direction: column; align-items: center; gap: 12px;
+	}
+	h1 { font-size: 15px; font-weight: 600; color: #8fb3ff; margin: 4px 0; }
+	.sub { font-size: 12px; color: #6b7684; margin-top: -8px; }
+	#wrap { width: 100%; max-width: 900px; display: flex; flex-direction: column; gap: 10px; }
+	#term {
+		background: #05070a; border: 1px solid #2a3140; border-radius: 6px;
+		padding: 10px 12px; height: 60vh; min-height: 320px; overflow-y: auto;
+		white-space: pre-wrap; word-break: break-all; font-size: 13px; line-height: 1.35;
+		outline: none;
+	}
+	#term:focus { border-color: #4c7cff; }
+	#hint { font-size: 11px; color: #6b7684; }
+	.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+	#status { font-size: 12px; color: #8fb3ff; }
+	.panel {
+		background: #161b24; border: 1px solid #2a3140; border-radius: 6px;
+		padding: 10px 12px; display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
+	}
+	.gpio { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+	.led {
+		width: 12px; height: 12px; border-radius: 50%; background: #333;
+		border: 1px solid #555; transition: background .1s;
+	}
+	.led.on { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+	button {
+		background: #232a38; color: #c9d1d9; border: 1px solid #384154; border-radius: 4px;
+		padding: 4px 10px; font-size: 12px; cursor: pointer; font-family: inherit;
+	}
+	button:hover { background: #2c3444; }
+	button:active { background: #1a1f29; }
+	a { color: #8fb3ff; }
+</style>
+</head>
+<body>
+
+<h1>ulinux-esp32 — porte para o navegador</h1>
+<div class="sub">RV32IMAFDC + virtio-mmio, mesma máquina do firmware ESP32, rodando 100% em JavaScript no navegador.</div>
+
+<div id="wrap">
+	<div class="panel">
+		<span id="status">carregando…</span>
+		<span style="flex:1"></span>
+		<div class="gpio"><span class="led" id="led0"></span>gpio0<button id="btn0">toggle</button></div>
+		<div class="gpio"><span class="led" id="led1"></span>gpio1<button id="btn1">toggle</button></div>
+		<button id="btnReset">reiniciar</button>
+	</div>
+
+	<div id="term" tabindex="0"></div>
+	<div id="hint">clique no terminal para focar e digitar. console é o hvc0 do guest (sem eco local — quem ecoa é o próprio kernel).</div>
+</div>
+
+<script>
+'use strict';
+
+// ===== emulator core (ported from main/ulinux-esp32.c + main/cpu.c) =====
+'use strict';
+/* RV32IMAFDC + virtio-mmio emulator core. Ported from the ESP-IDF ulinux-esp32.c/cpu.c C sources.
+ * No DOM/Node dependency here: the host environment supplies I/O via the `host` object passed to boot(). */
+
+// ===== address map =====
+const RAM_BASE      = 0x80000000;
+const GUEST_RAM_SIZE = 0xf00000; // 15MB
+const PLIC_BASE     = 0x40100000;
+const VIRTIO8_BASE  = 0x40080000;
+const SYSCON_BASE   = 0x40060000;
+const UART1_BASE    = 0x40050000;
+const VIRTIO4_BASE  = 0x40040000;
+const VIRTIO3_BASE  = 0x40030000;
+const VIRTIO2_BASE  = 0x40020000;
+const VIRTIO1_BASE  = 0x40010000;
+const CLINT_BASE    = 0x02000000;
+const DTB_BASE      = 0x00000000;
+
+const USER = 0, SUPERVISOR = 1, MACHINE = 3;
+
+const INSTRUCTION_ADDRESS_MISALIGNED = 0x0, INSTRUCTION_ACCESS_FAULT = 0x1, ILLEGAL_INSTRUCTION = 0x2, BREAKPOINT = 0x3,
+	LOAD_ADDRESS_MISALIGNED = 0x4, LOAD_ACCESS_FAULT = 0x5, STORE_AMO_ADDRESS_MISALIGNED = 0x6, STORE_AMO_ACCESS_FAULT = 0x7,
+	ENV_CALL_FROM_UMODE = 0x8, ENV_CALL_FROM_SMODE = 0x9, ENV_CALL_FROM_MMODE = 0xb,
+	INSTRUCTION_PAGE_FAULT = 0xc, LOAD_PAGE_FAULT = 0xd, STORE_AMO_PAGE_FAULT = 0xf;
+
+const SUPERVISOR_SOFTWARE_INTERRUPT = 0x1, MACHINE_SOFTWARE_INTERRUPT = 0x3, SUPERVISOR_TIMER_INTERRUPT = 0x5,
+	MACHINE_TIMER_INTERRUPT = 0x7, SUPERVISOR_EXTERNAL_INTERRUPT = 0x9, MACHINE_EXTERNAL_INTERRUPT = 0xb;
+
+const MAX_VQUEUE_SIZE = 32;
+const SZ_VIRTQ_DESC = 16;
+
+// ===== memory =====
+const ram = new Uint8Array(GUEST_RAM_SIZE);
+const ramDV = new DataView(ram.buffer);
+const low = new Uint8Array(4096);
+const lowDV = new DataView(low.buffer);
+
+let rootfs = null; // Uint8Array, set by boot()
+
+function memRead32(off) { return ramDV.getUint32(off, true); }
+function memWrite32(off, v) { ramDV.setUint32(off, v >>> 0, true); }
+function memRead16(off) { return ramDV.getUint16(off, true); }
+function memWrite16(off, v) { ramDV.setUint16(off, v & 0xffff, true); }
+function memRead8(off) { return ram[off]; }
+function memWrite8(off, v) { ram[off] = v & 0xff; }
+
+// ===== cpu / csr / device state =====
+const cpu = {
+	pc: 0x80000000,
+	xreg: new Array(32).fill(0),
+	freg: new BigUint64Array(32),
+	privilege: MACHINE,
+	reserved: 0,
+};
+cpu.xreg[11] = DTB_BASE;
+
+const csr = {
+	satp: 0, // raw 32-bit (mode:1<<31 | asid:9<<22 | ppn:22)
+	fflags: 0, frm: 0, fcsr: 0, misa: 0,
+	mstatus: 0, sstatus: 0, mhartid: 0,
+	mscratch: 0, sscratch: 0, mtvec: 0, stvec: 0,
+	mcountern: 0, scounteren: 0, mie: 0, sie: 0, mip: 0, sip: 0,
+	pmpaddr0: 0, pmpcfg0: 0, mepc: 0, sepc: 0, mcause: 0, scause: 0,
+	mtval: 0, stval: 0, mideleg: 0, medeleg: 0,
+};
+
+const clint = { time: 0, timecmp: 0 }; // plain Numbers, 32-bit halves combined as float64 (safe up to 2^53)
+const plic = { sclaim: 0 };
+
+const uart_com_1 = { ier: 0, fcr: 0, lcr: 0, lsr: (1 << 5), isr: 0, mcr: 0, msr: 0, dll: 0, dlm: 0, thr: 0, rhr: 0, spr: 0 };
+
+function makeVirtio(dev_id) {
+	return {
+		dev_id, dev_status: 0,
+		dev_feat: [0, 0], dev_feat_sel: 0,
+		guest_feat: [0, 0], guest_feat_sel: 0,
+		int_status: 0, queue_sel: 0,
+		config_space: null, // Uint8Array
+		queue: [0, 1, 2].map(() => ({ num: 0, ready: 0, desc_addr: 0, driver_addr: 0, dev_addr: 0, notify: 0 })),
+	};
+}
+const virtio1_console = makeVirtio(3);
+const virtio2_blk = makeVirtio(2);
+const virtio3_gpio = makeVirtio(41);
+const virtio4_i2c = makeVirtio(34);
+const virtio8_net = makeVirtio(1);
+
+const gpio_level = new Uint8Array(2);
+
+// ===== TLB =====
+const TLB_SIZE = 89;
+const tlbVaddr = new Uint32Array(TLB_SIZE).fill(0xFFFFFFFF);
+const tlbPaddr = new Uint32Array(TLB_SIZE).fill(0xFFFFFFFF);
+const tlbExcept = new Uint8Array(TLB_SIZE).fill(0xFF);
+
+function tlbFlush() {
+	tlbVaddr.fill(0xFFFFFFFF);
+	tlbPaddr.fill(0xFFFFFFFF);
+	tlbExcept.fill(0xFF);
+}
+
+// ===== float64 <-> raw bits (matches pack754_64/unpack754_64 in cpu.h) =====
+const f64buf = new ArrayBuffer(8);
+const f64view = new DataView(f64buf);
+function pack754_64(d) { f64view.setFloat64(0, d, true); return f64view.getBigUint64(0, true); }
+function unpack754_64(bits) { f64view.setBigUint64(0, bits, true); return f64view.getFloat64(0, true); }
+function pack754_32(f) { f64view.setFloat32(0, f, true); return f64view.getUint32(0, true); }
+function unpack754_32(bits) { f64view.setUint32(0, bits >>> 0, true); return f64view.getFloat32(0, true); }
+
+const U64_MASK = 0xFFFFFFFFFFFFFFFFn;
+const SIGN64 = 1n << 63n;
+
+// ===== register field helpers =====
+function RD(i) { return (i >>> 7) & 0x1f; }
+function RS1(i) { return (i >>> 15) & 0x1f; }
+function RS2(i) { return (i >>> 20) & 0x1f; }
+
+function immC_sext(raw, shiftN) { return (((raw << shiftN) << 16) >> 16) >> shiftN; }
+
+function immB(inst) {
+	const raw = ((inst & 0x80000000) >>> 19) | ((inst & 0x7E000000) >>> 20) | ((inst & 0x00000F00) >>> 7) | ((inst & 0x00000080) << 4);
+	return (raw << 19) >> 19;
+}
+function immJ(inst) {
+	const raw = ((inst & 0x80000000) >>> 11) | ((inst & 0x7FE00000) >>> 20) | ((inst & 0x00100000) >>> 9) | (inst & 0x000FF000);
+	return (raw << 11) >> 11;
+}
+function immS(inst) {
+	const raw = (inst & 0xFE000000) | ((inst & 0x00000F80) << 13);
+	return raw >> 20;
+}
+function immI(inst) { return inst >> 20; }
+
+// ===== CSR access (replaces C's uint32_t* csr_read_) =====
+function csrGet(offset) {
+	switch (offset) {
+		case 0x001: return csr.fflags;
+		case 0x002: return csr.frm;
+		case 0x003: return csr.fcsr;
+		case 0x100: return csr.sstatus;
+		case 0x104: return csr.sie;
+		case 0x105: return csr.stvec;
+		case 0x106: return csr.scounteren;
+		case 0x140: return csr.sscratch;
+		case 0x141: return csr.sepc;
+		case 0x142: return csr.scause;
+		case 0x143: return csr.stval;
+		case 0x144: return csr.sip;
+		case 0x180: return csr.satp;
+		case 0x300: return csr.mstatus;
+		case 0x301: return csr.misa;
+		case 0x302: return csr.medeleg;
+		case 0x303: return csr.mideleg;
+		case 0x304: return csr.mie;
+		case 0x305: return csr.mtvec;
+		case 0x306: return csr.mcountern;
+		case 0x340: return csr.mscratch;
+		case 0x341: return csr.mepc;
+		case 0x342: return csr.mcause;
+		case 0x343: return csr.mtval;
+		case 0x344: return csr.mip;
+		case 0x3a0: return csr.pmpcfg0;
+		case 0x3b0: return csr.pmpaddr0;
+		case 0xc01: return clint.time >>> 0;
+		case 0xc81: return Math.floor(clint.time / 4294967296) >>> 0;
+		case 0xf14: return csr.mhartid;
+		default: throw new Error('csrGet: unknown csr 0x' + offset.toString(16));
+	}
+}
+function csrSet(offset, value) {
+	value = value >>> 0;
+	switch (offset) {
+		case 0x001: csr.fflags = value; break;
+		case 0x002: csr.frm = value; break;
+		case 0x003: csr.fcsr = value; break;
+		case 0x100: csr.sstatus = value; break;
+		case 0x104: csr.sie = value; break;
+		case 0x105: csr.stvec = value; break;
+		case 0x106: csr.scounteren = value; break;
+		case 0x140: csr.sscratch = value; break;
+		case 0x141: csr.sepc = value; break;
+		case 0x142: csr.scause = value; break;
+		case 0x143: csr.stval = value; break;
+		case 0x144: csr.sip = value; break;
+		case 0x180: csr.satp = value; break;
+		case 0x300: csr.mstatus = value; break;
+		case 0x301: csr.misa = value; break;
+		case 0x302: csr.medeleg = value; break;
+		case 0x303: csr.mideleg = value; break;
+		case 0x304: csr.mie = value; break;
+		case 0x305: csr.mtvec = value; break;
+		case 0x306: csr.mcountern = value; break;
+		case 0x340: csr.mscratch = value; break;
+		case 0x341: csr.mepc = value; break;
+		case 0x342: csr.mcause = value; break;
+		case 0x343: csr.mtval = value; break;
+		case 0x344: csr.mip = value; break;
+		case 0x3a0: csr.pmpcfg0 = value; break;
+		case 0x3b0: csr.pmpaddr0 = value; break;
+		case 0xf14: csr.mhartid = value; break;
+		case 0xc01: clint.time = Math.floor(clint.time / 4294967296) * 4294967296 + value; break;
+		case 0xc81: clint.time = (clint.time % 4294967296) + value * 4294967296; break;
+		default: throw new Error('csrSet: unknown csr 0x' + offset.toString(16));
+	}
+}
+
+// ===== trap =====
+function cpu_take_trap(cause, tval) {
+	cause = cause >>> 0;
+
+	if (cpu.privilege <= SUPERVISOR
+			&& (((cause & 0x80000000) && ((csr.mideleg >>> (cause & 0x7FFFFFFF)) & 1)) || ((~cause & 0x80000000) && ((csr.medeleg >>> cause) & 1)))) {
+
+		csr.sepc = cpu.pc;
+
+		if (cause & 0x80000000) {
+			const vectored = (csr.stvec & 3) ? ((cause & 0x7FFFFFFF) << 2) : 0;
+			cpu.pc = ((csr.stvec & ~3) + vectored) >>> 0;
+		} else {
+			cpu.pc = csr.stvec & ~3;
+		}
+
+		csr.scause = cause;
+		csr.stval = tval >>> 0;
+
+		csr.sstatus &= ~(1 << 5);
+		csr.sstatus |= ((csr.sstatus >>> cpu.privilege) & 1) << 5;
+		csr.sstatus &= ~(1 << cpu.privilege);
+
+		csr.sstatus &= ~(1 << 8);
+		csr.sstatus |= (cpu.privilege << 8);
+
+		cpu.privilege = SUPERVISOR;
+
+	} else {
+
+		csr.mepc = cpu.pc;
+
+		if (cause & 0x80000000) {
+			const vectored = (csr.mtvec & 3) ? ((cause & 0x7FFFFFFF) << 2) : 0;
+			cpu.pc = ((csr.mtvec & ~3) + vectored) >>> 0;
+		} else {
+			cpu.pc = csr.mtvec & ~3;
+		}
+
+		csr.mcause = cause;
+		csr.mtval = tval >>> 0;
+
+		csr.mstatus &= ~(1 << 7);
+		csr.mstatus |= ((csr.mstatus >>> cpu.privilege) & 1) << 7;
+		csr.mstatus &= ~(1 << cpu.privilege);
+
+		csr.mstatus &= ~(3 << 11);
+		csr.mstatus |= (cpu.privilege << 11);
+
+		cpu.privilege = MACHINE;
+	}
+	csr.sstatus >>>= 0; csr.mstatus >>>= 0;
+}
+
+// ===== address translation (sv32) =====
+function cpu_addr_translate(addr, except) {
+	addr = addr >>> 0;
+
+	const tlbIdx = (addr >>> 12) % TLB_SIZE;
+
+	if (tlbVaddr[tlbIdx] === (addr & ~0xfff) >>> 0 && tlbExcept[tlbIdx] === except) {
+		return { ok: true, addr: (tlbPaddr[tlbIdx] | (addr & 0xfff)) >>> 0 };
+	}
+
+	if (((csr.satp >>> 31) & 1) && cpu.privilege <= SUPERVISOR) {
+
+		const vpn = [(addr >>> 12) & 0x3FF, (addr >>> 22) & 0x3FF];
+
+		let a = (csr.satp & 0x3FFFFF) << 12;
+
+		for (let i = 1; i >= 0; i--) {
+
+			const pteAddr = ((a | (vpn[i] << 2)) - RAM_BASE) >>> 0;
+			const pte = memRead32(pteAddr);
+
+			const v = pte & 1, r = (pte >>> 1) & 1, w = (pte >>> 2) & 1, x = (pte >>> 3) & 1;
+			let a_bit = (pte >>> 6) & 1, d_bit = (pte >>> 7) & 1;
+			const ppn0 = (pte >>> 10) & 0x3FF, ppn1 = (pte >>> 20) & 0xFFF;
+
+			if (!v) { cpu_take_trap(except, addr); return { ok: false }; }
+
+			if (r || x) {
+
+				if (except === STORE_AMO_PAGE_FAULT && !w) { cpu_take_trap(except, addr); return { ok: false }; }
+
+				if (!a_bit) memWrite32(pteAddr, pte | (1 << 6));
+				if (except === STORE_AMO_PAGE_FAULT && !d_bit) memWrite32(pteAddr, memRead32(pteAddr) | (1 << 7));
+
+				tlbVaddr[tlbIdx] = addr & ~0xfff;
+
+				let translated;
+				if (i === 1) translated = (((ppn1 << 10) | vpn[0]) << 12) | (addr & 0xfff);
+				else translated = (((ppn1 << 10) | ppn0) << 12) | (addr & 0xfff);
+				translated = translated >>> 0;
+
+				tlbPaddr[tlbIdx] = translated & ~0xfff;
+				tlbExcept[tlbIdx] = except;
+
+				return { ok: true, addr: translated };
+			}
+			a = (((ppn1 << 10) | ppn0) << 12) >>> 0;
+		}
+
+		cpu_take_trap(except, addr);
+		return { ok: false };
+	}
+
+	return { ok: true, addr };
+}
+
+// ===== devices =====
+function clint_read(offset) {
+	switch (offset) {
+		case 0x00004000: return clint.timecmp >>> 0;
+		case 0x00004004: return Math.floor(clint.timecmp / 4294967296) >>> 0;
+		default: return 0;
+	}
+}
+function clint_write(offset, value) {
+	value = value >>> 0;
+	switch (offset) {
+		case 0x00004000: clint.timecmp = Math.floor(clint.timecmp / 4294967296) * 4294967296 + value; break;
+		case 0x00004004: clint.timecmp = (clint.timecmp % 4294967296) + value * 4294967296; break;
+	}
+}
+
+function plic_read(offset) {
+	switch (offset) {
+		case 0x00200000: return 0;
+		case 0x00200004: {
+			let v = 0;
+			for (let irq = 1; irq < 32; irq++) if (plic.sclaim & (1 << irq)) v = irq;
+			return v;
+		}
+		default: return 0;
+	}
+}
+function plic_write(offset, value) {
+	if (offset === 0x200004) plic.sclaim &= ~(1 << value);
+}
+
+function uart1_write(offset, value) {
+	value &= 0xff;
+	switch (offset) {
+		case 0b000:
+			if (~uart_com_1.lcr & (1 << 7)) uart_com_1.thr = value; else uart_com_1.dll = value;
+			break;
+		case 0b001:
+			(uart_com_1.lcr & (1 << 7)) ? (uart_com_1.dlm = value) : (uart_com_1.ier = value);
+			if (uart_com_1.ier & (1 << 1)) { plic.sclaim |= (1 << 0x05); csr.sip |= (1 << SUPERVISOR_EXTERNAL_INTERRUPT); }
+			break;
+		case 0b010: uart_com_1.fcr = value; break;
+		case 0b011: uart_com_1.lcr = value; break;
+		case 0b100: uart_com_1.mcr = value; break;
+		case 0b111: uart_com_1.spr = value; break;
+		default: throw new Error('uart1_write: bad offset');
+	}
+}
+function uart1_read(offset) {
+	switch (offset) {
+		case 0b000: { const v = (uart_com_1.lcr & (1 << 7)) ? uart_com_1.dll : uart_com_1.rhr; uart_com_1.lsr &= ~1; return v; }
+		case 0b001: return (uart_com_1.lcr & (1 << 7)) ? uart_com_1.dlm : uart_com_1.ier;
+		case 0b010: return uart_com_1.isr;
+		case 0b011: return uart_com_1.lcr;
+		case 0b100: return uart_com_1.mcr;
+		case 0b101: return uart_com_1.lsr;
+		case 0b110: return uart_com_1.msr;
+		case 0b111: return uart_com_1.spr;
+		default: throw new Error('uart1_read: bad offset');
+	}
+}
+
+function virtio_read(offset, size, virtio) {
+	switch (offset) {
+		case 0x000: return 0x74726976;
+		case 0x004: return 2;
+		case 0x008: return virtio.dev_id;
+		case 0x010: return virtio.dev_feat[virtio.dev_feat_sel];
+		case 0x00c: return 0x0000ffff;
+		case 0x034: return MAX_VQUEUE_SIZE;
+		case 0x044: return virtio.queue[virtio.queue_sel].ready;
+		case 0x060: return virtio.int_status;
+		case 0x070: return virtio.dev_status;
+		case 0x0fc: return 0;
+		default:
+			if (offset >= 0x100) {
+				const o = offset - 0x100;
+				if (size === 1) return virtio.config_space[o];
+				if (size === 2) return virtio.config_space[o] | (virtio.config_space[o + 1] << 8);
+				return (virtio.config_space[o] | (virtio.config_space[o + 1] << 8) | (virtio.config_space[o + 2] << 16) | (virtio.config_space[o + 3] << 24)) >>> 0;
+			}
+			throw new Error('virtio_read: address not found 0x' + offset.toString(16));
+	}
+}
+function virtio_write(offset, size, value, virtio) {
+	value = value >>> 0;
+	switch (offset) {
+		case 0x014: virtio.dev_feat_sel = value; break;
+		case 0x020: virtio.guest_feat[virtio.guest_feat_sel] = value; break;
+		case 0x024: virtio.guest_feat_sel = value; break;
+		case 0x030: virtio.queue_sel = value; break;
+		case 0x038: virtio.queue[virtio.queue_sel].num = value; break;
+		case 0x044: virtio.queue[virtio.queue_sel].ready = value; break;
+		case 0x050: virtio.queue[value].notify = 1; break;
+		case 0x064: virtio.int_status &= ~value; break;
+		case 0x070: virtio.dev_status = value; break;
+		case 0x080: virtio.queue[virtio.queue_sel].desc_addr = value; break;
+		case 0x084: break; /*upper 32 bits of desc_addr; guest is 32-bit, always writes 0 here*/
+		case 0x090: virtio.queue[virtio.queue_sel].driver_addr = value; break;
+		case 0x094: break;
+		case 0x0a0: virtio.queue[virtio.queue_sel].dev_addr = value; break;
+		case 0x0a4: break;
+		default: throw new Error('virtio_write: address not found 0x' + offset.toString(16));
+	}
+}
+
+// ===== bus =====
+function bus_read(addr, size) {
+	addr = addr >>> 0;
+
+	if (addr >= RAM_BASE) {
+		const off = (addr - RAM_BASE) >>> 0;
+		return size === 1 ? memRead8(off) : size === 2 ? memRead16(off) : memRead32(off);
+	}
+	if (addr >= CLINT_BASE && addr <= (CLINT_BASE + 0xc0000)) return clint_read(addr - CLINT_BASE);
+	if (addr >= PLIC_BASE && addr <= (PLIC_BASE + 0x400000)) return plic_read(addr - PLIC_BASE);
+	if (addr >= VIRTIO8_BASE && addr <= (VIRTIO8_BASE + 0x1000)) return virtio_read(addr - VIRTIO8_BASE, size, virtio8_net);
+	if (addr >= UART1_BASE && addr <= (UART1_BASE + 0x100)) return uart1_read(addr - UART1_BASE);
+	if (addr >= VIRTIO4_BASE && addr <= (VIRTIO4_BASE + 0x1000)) return virtio_read(addr - VIRTIO4_BASE, size, virtio4_i2c);
+	if (addr >= SYSCON_BASE && addr <= (SYSCON_BASE + 0x1000)) return 0;
+	if (addr >= VIRTIO3_BASE && addr <= (VIRTIO3_BASE + 0x1000)) return virtio_read(addr - VIRTIO3_BASE, size, virtio3_gpio);
+	if (addr >= VIRTIO2_BASE && addr <= (VIRTIO2_BASE + 0x1000)) return virtio_read(addr - VIRTIO2_BASE, size, virtio2_blk);
+	if (addr >= VIRTIO1_BASE && addr <= (VIRTIO1_BASE + 0x1000)) return virtio_read(addr - VIRTIO1_BASE, size, virtio1_console);
+	if (addr <= (DTB_BASE + 4096)) {
+		const off = addr - DTB_BASE;
+		return size === 1 ? low[off] : size === 2 ? lowDV.getUint16(off, true) : lowDV.getUint32(off, true);
+	}
+
+	cpu_take_trap(LOAD_ACCESS_FAULT, addr);
+	return 0;
+}
+function bus_write(addr, size, value) {
+	addr = addr >>> 0;
+	value = value >>> 0;
+
+	if (addr >= RAM_BASE) {
+		const off = (addr - RAM_BASE) >>> 0;
+		if (size === 1) memWrite8(off, value); else if (size === 2) memWrite16(off, value); else memWrite32(off, value);
+		return;
+	}
+	if (addr >= CLINT_BASE && addr <= (CLINT_BASE + 0xc0000)) return clint_write(addr - CLINT_BASE, value);
+	if (addr >= PLIC_BASE && addr <= (PLIC_BASE + 0x400000)) return plic_write(addr - PLIC_BASE, value);
+	if (addr >= VIRTIO8_BASE && addr <= (VIRTIO8_BASE + 0x1000)) return virtio_write(addr - VIRTIO8_BASE, size, value, virtio8_net);
+	if (addr >= UART1_BASE && addr <= (UART1_BASE + 0x100)) return uart1_write(addr - UART1_BASE, value);
+	if (addr >= VIRTIO4_BASE && addr <= (VIRTIO4_BASE + 0x1000)) return virtio_write(addr - VIRTIO4_BASE, size, value, virtio4_i2c);
+	if (addr >= SYSCON_BASE && addr <= (SYSCON_BASE + 0x1000)) {
+		if (addr - SYSCON_BASE === 0 && (value === 0x00007777 || value === 0x00005555)) hostRef.exit(0);
+		return;
+	}
+	if (addr >= VIRTIO3_BASE && addr <= (VIRTIO3_BASE + 0x1000)) return virtio_write(addr - VIRTIO3_BASE, size, value, virtio3_gpio);
+	if (addr >= VIRTIO2_BASE && addr <= (VIRTIO2_BASE + 0x1000)) return virtio_write(addr - VIRTIO2_BASE, size, value, virtio2_blk);
+	if (addr >= VIRTIO1_BASE && addr <= (VIRTIO1_BASE + 0x1000)) return virtio_write(addr - VIRTIO1_BASE, size, value, virtio1_console);
+	if (addr <= (DTB_BASE + 4096)) {
+		const off = addr - DTB_BASE;
+		if (size === 1) low[off] = value & 0xff; else if (size === 2) lowDV.setUint16(off, value & 0xffff, true); else lowDV.setUint32(off, value, true);
+		return;
+	}
+
+	cpu_take_trap(STORE_AMO_ACCESS_FAULT, addr);
+}
+
+// ===== instruction execute (ported from cpu.c) =====
+function cpu_execute(inst) {
+
+	cpu.xreg[0] = 0;
+
+	if ((inst & 3) === 3) {
+
+		if (((inst & 0x707f) >>> 0) === 0x2003) { /*lw*/
+			const imm = immI(inst);
+			const addr = (cpu.xreg[RS1(inst)] + imm) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; cpu.xreg[RD(inst)] = bus_read(t.addr, 4); }
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x2023) { /*sw*/
+			const addr = (cpu.xreg[RS1(inst)] + immS(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; bus_write(t.addr, 4, cpu.xreg[RS2(inst)]); }
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x0013) { /*addi*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] + immI(inst)) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x1063) { /*bne*/
+			if (cpu.xreg[RS1(inst)] !== cpu.xreg[RS2(inst)]) cpu.pc = (cpu.pc + immB(inst)) >>> 0;
+			else cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x4003) { /*lbu*/
+			const addr = (cpu.xreg[RS1(inst)] + immI(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; cpu.xreg[RD(inst)] = bus_read(t.addr, 1) & 0xff; }
+			return;
+		}
+		if (((inst & 0x7f) >>> 0) === 0x37) { /*lui*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (inst & 0xfffff000) >>> 0;
+			return;
+		}
+		if (((inst & 0x7f) >>> 0) === 0x6f) { /*jal*/
+			cpu.xreg[RD(inst)] = (cpu.pc + 4) >>> 0;
+			cpu.pc = (cpu.pc + immJ(inst)) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x0063) { /*beq*/
+			if (cpu.xreg[RS1(inst)] === cpu.xreg[RS2(inst)]) cpu.pc = (cpu.pc + immB(inst)) >>> 0;
+			else cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x7013) { /*andi*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] & immI(inst)) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x6063) { /*bltu*/
+			if ((cpu.xreg[RS1(inst)] >>> 0) < (cpu.xreg[RS2(inst)] >>> 0)) cpu.pc = (cpu.pc + immB(inst)) >>> 0;
+			else cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x40000033) { /*sub*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] - cpu.xreg[RS2(inst)]) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x00000033) { /*add*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] + cpu.xreg[RS2(inst)]) >>> 0;
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0x00001013) { /*slli*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const imm = (inst & 0x1f00000) >>> 20;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] << imm) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x7063) { /*bgeu*/
+			if ((cpu.xreg[RS1(inst)] >>> 0) >= (cpu.xreg[RS2(inst)] >>> 0)) cpu.pc = (cpu.pc + immB(inst)) >>> 0;
+			else cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x00003033) { /*sltu*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = ((cpu.xreg[RS1(inst)] >>> 0) < (cpu.xreg[RS2(inst)] >>> 0)) ? 1 : 0;
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0x00005013) { /*srli*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const imm = (inst & 0x1f00000) >>> 20;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] >>> imm) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x0023) { /*sb*/
+			const addr = (cpu.xreg[RS1(inst)] + immS(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; bus_write(t.addr, 1, cpu.xreg[RS2(inst)]); }
+			return;
+		}
+		if (((inst & 0x7f) >>> 0) === 0x17) { /*auipc*/
+			const imm = inst & 0xfffff000;
+			cpu.xreg[RD(inst)] = (cpu.pc + imm) >>> 0;
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x4063) { /*blt*/
+			if ((cpu.xreg[RS1(inst)] | 0) < (cpu.xreg[RS2(inst)] | 0)) cpu.pc = (cpu.pc + immB(inst)) >>> 0;
+			else cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x0067) { /*jalr*/
+			const tmp = (cpu.pc + 4) >>> 0;
+			cpu.pc = ((cpu.xreg[RS1(inst)] + immI(inst)) & ~1) >>> 0;
+			cpu.xreg[RD(inst)] = tmp;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x4013) { /*xori*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] ^ immI(inst)) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x5063) { /*bge*/
+			if ((cpu.xreg[RS1(inst)] | 0) >= (cpu.xreg[RS2(inst)] | 0)) cpu.pc = (cpu.pc + immB(inst)) >>> 0;
+			else cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x00006033) { /*or*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] | cpu.xreg[RS2(inst)]) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x02000033) { /*mul*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = Math.imul(cpu.xreg[RS1(inst)] | 0, cpu.xreg[RS2(inst)] | 0) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x00004033) { /*xor*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] ^ cpu.xreg[RS2(inst)]) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x7073) { /*csrrci*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const imm = (inst >>> 15) & 0x1f;
+			const addr = inst >>> 20;
+			const old = csrGet(addr);
+			cpu.xreg[RD(inst)] = old;
+			csrSet(addr, old & ~imm);
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x5003) { /*lhu*/
+			const addr = (cpu.xreg[RS1(inst)] + immI(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; cpu.xreg[RD(inst)] = bus_read(t.addr, 2) & 0xffff; }
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x2073) { /*csrrs*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const addr = inst >>> 20;
+			const old = csrGet(addr);
+			csrSet(addr, (old | cpu.xreg[RS1(inst)]) >>> 0);
+			cpu.xreg[RD(inst)] = old;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x00005033) { /*srl*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] >>> (cpu.xreg[RS2(inst)] & 0x1f)) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x00007033) { /*and*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] & cpu.xreg[RS2(inst)]) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x00001033) { /*sll*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] << (cpu.xreg[RS2(inst)] & 0x1f)) >>> 0;
+			return;
+		}
+		if (((inst & 0xf00fffff) >>> 0) === 0x0000000f) { /*fence*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x6073) { /*csrrsi*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const imm = (inst >>> 15) & 0x1f;
+			const addr = inst >>> 20;
+			const old = csrGet(addr);
+			cpu.xreg[RD(inst)] = old;
+			csrSet(addr, (old | imm) >>> 0);
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0x0000202f) { /*amoadd.w*/
+			const addr = cpu.xreg[RS1(inst)] >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) {
+				cpu.pc = (cpu.pc + 4) >>> 0;
+				const value = bus_read(t.addr, 4);
+				bus_write(t.addr, 4, (value + cpu.xreg[RS2(inst)]) >>> 0);
+				cpu.xreg[RD(inst)] = value;
+			}
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x0003) { /*lb*/
+			const addr = (cpu.xreg[RS1(inst)] + immI(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; cpu.xreg[RD(inst)] = ((bus_read(t.addr, 1) << 24) >> 24) >>> 0; }
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x3013) { /*sltiu*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = ((cpu.xreg[RS1(inst)] >>> 0) < (immI(inst) >>> 0)) ? 1 : 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x1023) { /*sh*/
+			const addr = (cpu.xreg[RS1(inst)] + immS(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; bus_write(t.addr, 2, cpu.xreg[RS2(inst)]); }
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x6013) { /*ori*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RS1(inst)] | immI(inst)) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x02003033) { /*mulhu*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = Number((BigInt(cpu.xreg[RS1(inst)] >>> 0) * BigInt(cpu.xreg[RS2(inst)] >>> 0)) >> 32n) >>> 0;
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0x40005013) { /*srai*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const imm = (inst & 0x01f00000) >>> 20;
+			cpu.xreg[RD(inst)] = ((cpu.xreg[RS1(inst)] | 0) >> imm) >>> 0;
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0x1800202f) { /*sc.w*/
+			if (cpu.reserved === cpu.xreg[RS1(inst)]) {
+				const addr = cpu.xreg[RS1(inst)] >>> 0;
+				const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+				if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; bus_write(t.addr, 4, cpu.xreg[RS2(inst)]); cpu.xreg[RD(inst)] = 0; }
+			} else {
+				cpu.pc = (cpu.pc + 4) >>> 0;
+				cpu.xreg[RD(inst)] = 1;
+			}
+			return;
+		}
+		if (((inst & 0xf9f0707f) >>> 0) === 0x1000202f) { /*lr.w*/
+			const addr = cpu.xreg[RS1(inst)] >>> 0;
+			cpu.reserved = addr;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; cpu.xreg[RD(inst)] = bus_read(t.addr, 4); }
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0x4000202f) { /*amoor.w*/
+			const addr = cpu.xreg[RS1(inst)] >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) {
+				cpu.pc = (cpu.pc + 4) >>> 0;
+				const value = bus_read(t.addr, 4);
+				bus_write(t.addr, 4, (value | cpu.xreg[RS2(inst)]) >>> 0);
+				cpu.xreg[RD(inst)] = value;
+			}
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x40005033) { /*sra*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = ((cpu.xreg[RS1(inst)] | 0) >> (cpu.xreg[RS2(inst)] & 0x1f)) >>> 0;
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0x6000202f) { /*amoand.w*/
+			const addr = cpu.xreg[RS1(inst)] >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) {
+				cpu.pc = (cpu.pc + 4) >>> 0;
+				const value = bus_read(t.addr, 4);
+				bus_write(t.addr, 4, (value & cpu.xreg[RS2(inst)]) >>> 0);
+				cpu.xreg[RD(inst)] = value;
+			}
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x1003) { /*lh*/
+			const addr = (cpu.xreg[RS1(inst)] + immI(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 4) >>> 0; cpu.xreg[RD(inst)] = ((bus_read(t.addr, 2) << 16) >> 16) >>> 0; }
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x1073) { /*csrrw*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const addr = inst >>> 20;
+			const old = csrGet(addr);
+			csrSet(addr, cpu.xreg[RS1(inst)]);
+			cpu.xreg[RD(inst)] = old;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x02007033) { /*remu*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const b = cpu.xreg[RS2(inst)] >>> 0;
+			cpu.xreg[RD(inst)] = (b === 0) ? 0xffffffff : ((cpu.xreg[RS1(inst)] >>> 0) % b) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x3073) { /*csrrc*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const addr = inst >>> 20;
+			const old = csrGet(addr);
+			csrSet(addr, (old & ~cpu.xreg[RS1(inst)]) >>> 0);
+			cpu.xreg[RD(inst)] = old;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x02005033) { /*divu*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const b = cpu.xreg[RS2(inst)] >>> 0;
+			cpu.xreg[RD(inst)] = (b === 0) ? 0xffffffff : Math.floor((cpu.xreg[RS1(inst)] >>> 0) / b) >>> 0;
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0x0800202f) { /*amoswap.w*/
+			const addr = cpu.xreg[RS1(inst)] >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) {
+				cpu.pc = (cpu.pc + 4) >>> 0;
+				const value = bus_read(t.addr, 4);
+				bus_write(t.addr, 4, cpu.xreg[RS2(inst)]);
+				cpu.xreg[RD(inst)] = value;
+			}
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x12000073) { /*sfence.vma*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			tlbFlush();
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x02004033) { /*div*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const a = cpu.xreg[RS1(inst)] | 0, b = cpu.xreg[RS2(inst)] | 0;
+			cpu.xreg[RD(inst)] = (b === 0) ? 0xffffffff : Math.trunc(a / b) >>> 0;
+			return;
+		}
+		if (inst === 0x0000100f) { /*fence.i*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+		if (inst === 0x10200073) { /*sret*/
+			tlbFlush();
+			cpu.privilege = (csr.sstatus >>> 8) & 1;
+			csr.sstatus &= ~(1 << 8);
+			csr.sstatus &= ~(1 << cpu.privilege);
+			csr.sstatus |= ((csr.sstatus >>> 5) & 1) << cpu.privilege;
+			csr.sstatus |= (1 << 5);
+			csr.sstatus >>>= 0;
+			cpu.pc = csr.sepc;
+			return;
+		}
+		if (inst === 0x00000073) { /*ecall*/
+			cpu_take_trap((cpu.privilege + 8) >>> 0, 0);
+			return;
+		}
+		if (inst === 0x30200073) { /*mret*/
+			cpu.privilege = (csr.mstatus >>> 11) & 3;
+			csr.mstatus &= ~(3 << 11);
+			csr.mstatus &= ~(1 << cpu.privilege);
+			csr.mstatus |= ((csr.mstatus >>> 7) & 1) << cpu.privilege;
+			csr.mstatus |= (1 << 7);
+			csr.mstatus >>>= 0;
+			cpu.pc = csr.mepc;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x00002033) { /*slt*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = ((cpu.xreg[RS1(inst)] | 0) < (cpu.xreg[RS2(inst)] | 0)) ? 1 : 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x02006033) { /*rem*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const a = cpu.xreg[RS1(inst)] | 0, b = cpu.xreg[RS2(inst)] | 0;
+			cpu.xreg[RD(inst)] = (b === 0) ? (a >>> 0) : (a % b) >>> 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x02001033) { /*mulh*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = Number((BigInt(cpu.xreg[RS1(inst)] | 0) * BigInt(cpu.xreg[RS2(inst)] | 0)) >> 32n) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x2013) { /*slti*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = ((cpu.xreg[RS1(inst)] | 0) < immI(inst)) ? 1 : 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x5073) { /*csrrwi*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const imm = (inst >>> 15) & 0x1f;
+			const addr = inst >>> 20;
+			cpu.xreg[RD(inst)] = csrGet(addr);
+			csrSet(addr, imm);
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0xe000202f) { /*amomaxu.w*/
+			const addr = cpu.xreg[RS1(inst)] >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) {
+				cpu.pc = (cpu.pc + 4) >>> 0;
+				const value = bus_read(t.addr, 4);
+				bus_write(t.addr, 4, Math.max(value >>> 0, cpu.xreg[RS2(inst)] >>> 0) >>> 0);
+				cpu.xreg[RD(inst)] = value;
+			}
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x02002033) { /*mulhsu*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = Number((BigInt(cpu.xreg[RS1(inst)] | 0) * BigInt(cpu.xreg[RS2(inst)] >>> 0)) >> 32n) >>> 0;
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x3027) { /*fsd*/
+			const addr = (cpu.xreg[RS1(inst)] + immS(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) {
+				cpu.pc = (cpu.pc + 4) >>> 0;
+				const off = (t.addr - RAM_BASE) >>> 0;
+				ramDV.setBigUint64(off, cpu.freg[RS2(inst)], true);
+			}
+			return;
+		}
+		if (((inst & 0x707f) >>> 0) === 0x3007) { /*fld*/
+			const addr = (cpu.xreg[RS1(inst)] + immI(inst)) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) {
+				cpu.pc = (cpu.pc + 4) >>> 0;
+				const off = (t.addr - RAM_BASE) >>> 0;
+				cpu.freg[RD(inst)] = ramDV.getBigUint64(off, true);
+			}
+			return;
+		}
+		if (((inst & 0xf800707f) >>> 0) === 0xa0002053) { /*feq.s / feq.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.freg[RS1(inst)] === cpu.freg[RS2(inst)]) ? 1 : 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0xa2001053) { /*flt.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (unpack754_64(cpu.freg[RS1(inst)]) < unpack754_64(cpu.freg[RS2(inst)])) ? 1 : 0;
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0xa2000053) { /*fle.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (unpack754_64(cpu.freg[RS1(inst)]) <= unpack754_64(cpu.freg[RS2(inst)])) ? 1 : 0;
+			return;
+		}
+		if (((inst & 0xfe00007f) >>> 0) === 0x02000053) { /*fadd.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = pack754_64(unpack754_64(cpu.freg[RS1(inst)]) + unpack754_64(cpu.freg[RS2(inst)]));
+			return;
+		}
+		if (((inst & 0xfe00007f) >>> 0) === 0x0a000053) { /*fsub.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = pack754_64(unpack754_64(cpu.freg[RS1(inst)]) - unpack754_64(cpu.freg[RS2(inst)]));
+			return;
+		}
+		if (((inst & 0xfe00007f) >>> 0) === 0x12000053) { /*fmul.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = pack754_64(unpack754_64(cpu.freg[RS1(inst)]) * unpack754_64(cpu.freg[RS2(inst)]));
+			return;
+		}
+		if (((inst & 0xfe00007f) >>> 0) === 0x1a000053) { /*fdiv.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = pack754_64(unpack754_64(cpu.freg[RS1(inst)]) / unpack754_64(cpu.freg[RS2(inst)]));
+			return;
+		}
+		if (((inst & 0xfff0007f) >>> 0) === 0xd2000053) { /*fcvt.d.w*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = pack754_64(cpu.xreg[RS1(inst)] | 0);
+			return;
+		}
+		if (((inst & 0xfff0007f) >>> 0) === 0xc2000053) { /*fcvt.w.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (unpack754_64(cpu.freg[RS1(inst)]) | 0) >>> 0;
+			return;
+		}
+		if (((inst & 0xfff0007f) >>> 0) === 0xd2100053) { /*fcvt.d.wu*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = pack754_64(cpu.xreg[RS1(inst)] >>> 0);
+			return;
+		}
+		if (((inst & 0xfff0007f) >>> 0) === 0xc2100053) { /*fcvt.wu.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = (unpack754_64(cpu.freg[RS1(inst)]) >>> 0);
+			return;
+		}
+		if (((inst & 0xfff0707f) >>> 0) === 0xf0000053) { /*fmv.w.x*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = BigInt(cpu.xreg[RS1(inst)] >>> 0);
+			return;
+		}
+		if (((inst & 0xfff0707f) >>> 0) === 0xe0000053) { /*fmv.x.w*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.xreg[RD(inst)] = Number(cpu.freg[RS1(inst)] & 0xffffffffn) >>> 0;
+			return;
+		}
+		if (((inst & 0x0600007f) >>> 0) === 0x0200004b) { /*fnmsub.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const rs3 = (inst >>> 27) & 0x1f;
+			cpu.freg[RD(inst)] = pack754_64(-unpack754_64(cpu.freg[RS1(inst)]) * unpack754_64(cpu.freg[RS2(inst)]) + unpack754_64(cpu.freg[rs3]));
+			return;
+		}
+		if (((inst & 0x0600007f) >>> 0) === 0x02000043) { /*fmadd.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			const rs3 = (inst >>> 27) & 0x1f;
+			cpu.freg[RD(inst)] = pack754_64(unpack754_64(cpu.freg[RS1(inst)]) * unpack754_64(cpu.freg[RS2(inst)]) + unpack754_64(cpu.freg[rs3]));
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x22000053) { /*fsgnj.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = (cpu.freg[RS1(inst)] & ~SIGN64 & U64_MASK) | (cpu.freg[RS2(inst)] & SIGN64);
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x22001053) { /*fsgnjn.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = (cpu.freg[RS1(inst)] & ~SIGN64 & U64_MASK) | ((~cpu.freg[RS2(inst)] & U64_MASK) & SIGN64);
+			return;
+		}
+		if (((inst & 0xfe00707f) >>> 0) === 0x22002053) { /*fsgnjx.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = (cpu.freg[RS1(inst)] & ~SIGN64 & U64_MASK) | ((cpu.freg[RS2(inst)] ^ cpu.freg[RS1(inst)]) & SIGN64);
+			return;
+		}
+		if (((inst & 0xfff0007f) >>> 0) === 0x40100053) { /*fcvt.s.d*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = BigInt(pack754_32(Math.fround(unpack754_64(cpu.freg[RS1(inst)]))));
+			return;
+		}
+		if (((inst & 0xfff0007f) >>> 0) === 0x42000053) { /*fcvt.d.s*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			cpu.freg[RD(inst)] = pack754_64(unpack754_32(Number(cpu.freg[RS1(inst)] & 0xffffffffn)));
+			return;
+		}
+		if (inst === 0x10500073) { /*wfi*/
+			cpu.pc = (cpu.pc + 4) >>> 0;
+			return;
+		}
+
+	} else {
+
+		if (((inst & 0xe003) >>> 0) === 0xc002) { /*c.swsp*/
+			const imm = ((inst & 0x1e00) >>> 7) | ((inst & 0x180) >>> 1);
+			const addr = (cpu.xreg[2] + imm) >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 2) >>> 0; bus_write(t.addr, 4, cpu.xreg[(inst >>> 2) & 0x1f]); }
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0x4002) { /*c.lwsp*/
+			const imm = ((inst & 0x1000) >>> 7) | ((inst & 0x70) >>> 2) | ((inst & 0xc) << 4);
+			const addr = (cpu.xreg[2] + imm) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 2) >>> 0; cpu.xreg[RD(inst)] = bus_read(t.addr, 4); }
+			return;
+		}
+		if (((inst & 0xf07f) >>> 0) === 0x8002) { /*c.jr*/
+			cpu.pc = cpu.xreg[RD(inst)] >>> 0;
+			return;
+		} else if (((inst & 0xf003) >>> 0) === 0x8002) { /*c.mv*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			cpu.xreg[RD(inst)] = cpu.xreg[(inst >>> 2) & 0x1f];
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0x0001) { /*c.addi/c.nop*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const raw = ((inst & 0x1000) >>> 7) | ((inst & 0x7c) >>> 2);
+			cpu.xreg[RD(inst)] = (cpu.xreg[RD(inst)] + immC_sext(raw, 10)) >>> 0;
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0x4000) { /*c.lw*/
+			const imm = ((inst & 0x1c00) >>> 7) | ((inst & 0x40) >>> 4) | ((inst & 0x20) << 1);
+			const addr = (cpu.xreg[((inst >>> 7) & 0x7) + 8] + imm) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 2) >>> 0; cpu.xreg[((inst >>> 2) & 0x7) + 8] = bus_read(t.addr, 4); }
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0x4001) { /*c.li*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const raw = ((inst & 0x1000) >>> 7) | ((inst & 0x7c) >>> 2);
+			cpu.xreg[RD(inst)] = immC_sext(raw, 10) >>> 0;
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0xc001) { /*c.beqz*/
+			const raw = ((inst & 0x1000) >>> 4) | ((inst & 0xc00) >>> 7) | ((inst & 0x60) << 1) | ((inst & 0x18) >>> 2) | ((inst & 0x4) << 3);
+			if (cpu.xreg[((inst >>> 7) & 0x7) + 8] === 0) cpu.pc = (cpu.pc + immC_sext(raw, 7)) >>> 0;
+			else cpu.pc = (cpu.pc + 2) >>> 0;
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0x0000) { /*c.addi4spn*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const imm = ((inst & 0x1800) >>> 7) | ((inst & 0x780) >>> 1) | ((inst & 0x40) >>> 4) | ((inst & 0x20) >>> 2);
+			cpu.xreg[((inst >>> 2) & 0x7) + 8] = (cpu.xreg[2] + imm) >>> 0;
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0xe001) { /*c.bnez*/
+			const raw = ((inst & 0x1000) >>> 4) | ((inst & 0xc00) >>> 7) | ((inst & 0x60) << 1) | ((inst & 0x18) >>> 2) | ((inst & 0x4) << 3);
+			if (cpu.xreg[((inst >>> 7) & 0x7) + 8] !== 0) cpu.pc = (cpu.pc + immC_sext(raw, 7)) >>> 0;
+			else cpu.pc = (cpu.pc + 2) >>> 0;
+			return;
+		}
+		if (((inst & 0xf07f) >>> 0) === 0x9002) { /*c.jalr*/
+			const tmp = (cpu.pc + 2) >>> 0;
+			cpu.pc = cpu.xreg[RD(inst)] >>> 0;
+			cpu.xreg[1] = tmp;
+			return;
+		} else if (((inst & 0xf003) >>> 0) === 0x9002) { /*c.add*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RD(inst)] + cpu.xreg[(inst >>> 2) & 0x1f]) >>> 0;
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0xa001) { /*c.j*/
+			const raw = ((inst & 0x1000) >>> 1) | ((inst & 0x800) >>> 7) | ((inst & 0x600) >>> 1) | ((inst & 0x100) << 2) | ((inst & 0x80) >>> 1) | ((inst & 0x40) << 1) | ((inst & 0x38) >>> 2) | ((inst & 0x4) << 3);
+			cpu.pc = (cpu.pc + immC_sext(raw, 4)) >>> 0;
+			return;
+		}
+		if (((inst & 0xef83) >>> 0) === 0x6101) { /*c.addi16sp*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const raw = ((inst & 0x1000) >>> 3) | ((inst & 0x40) >>> 2) | ((inst & 0x20) << 1) | ((inst & 0x18) << 4) | ((inst & 0x4) << 3);
+			cpu.xreg[2] = (cpu.xreg[2] + immC_sext(raw, 6)) >>> 0;
+			return;
+		} else if (((inst & 0xe003) >>> 0) === 0x6001) { /*c.lui*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const raw = ((inst & 0x1000) << 5) | ((inst & 0x7c) << 10);
+			cpu.xreg[RD(inst)] = ((raw << 14) >> 14) >>> 0;
+			return;
+		}
+		if (((inst & 0xec03) >>> 0) === 0x8801) { /*c.andi*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const raw = ((inst & 0x1000) >>> 7) | ((inst & 0x7c) >>> 2);
+			cpu.xreg[((inst >>> 7) & 0x7) + 8] = (cpu.xreg[((inst >>> 7) & 0x7) + 8] & immC_sext(raw, 10)) >>> 0;
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0x2001) { /*c.jal*/
+			const raw = ((inst & 0x1000) >>> 1) | ((inst & 0x800) >>> 7) | ((inst & 0x600) >>> 1) | ((inst & 0x100) << 2) | ((inst & 0x80) >>> 1) | ((inst & 0x40) << 1) | ((inst & 0x38) >>> 2) | ((inst & 0x4) << 3);
+			cpu.xreg[1] = (cpu.pc + 2) >>> 0;
+			cpu.pc = (cpu.pc + immC_sext(raw, 4)) >>> 0;
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0xc000) { /*c.sw*/
+			const imm = ((inst & 0x1c00) >>> 7) | ((inst & 0x40) >>> 4) | ((inst & 0x20) << 1);
+			const addr = (cpu.xreg[((inst >>> 7) & 0x7) + 8] + imm) >>> 0;
+			const t = cpu_addr_translate(addr, STORE_AMO_PAGE_FAULT);
+			if (t.ok) { cpu.pc = (cpu.pc + 2) >>> 0; bus_write(t.addr, 4, cpu.xreg[((inst >>> 2) & 0x7) + 8]); }
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0x0002) { /*c.slli*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const imm = (inst & 0x7c) >>> 2;
+			cpu.xreg[RD(inst)] = (cpu.xreg[RD(inst)] << imm) >>> 0;
+			return;
+		}
+		if (((inst & 0xec03) >>> 0) === 0x8001) { /*c.srli*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const imm = (inst >>> 2) & 0x1f;
+			cpu.xreg[((inst >>> 7) & 0x7) + 8] = (cpu.xreg[((inst >>> 7) & 0x7) + 8] >>> imm) >>> 0;
+			return;
+		}
+		if (((inst & 0xfc63) >>> 0) === 0x8c41) { /*c.or*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			cpu.xreg[((inst >>> 7) & 0x7) + 8] = (cpu.xreg[((inst >>> 7) & 0x7) + 8] | cpu.xreg[((inst >>> 2) & 0x7) + 8]) >>> 0;
+			return;
+		}
+		if (((inst & 0xfc63) >>> 0) === 0x8c61) { /*c.and*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			cpu.xreg[((inst >>> 7) & 0x7) + 8] = (cpu.xreg[((inst >>> 7) & 0x7) + 8] & cpu.xreg[((inst >>> 2) & 0x7) + 8]) >>> 0;
+			return;
+		}
+		if (((inst & 0xfc63) >>> 0) === 0x8c01) { /*c.sub*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			cpu.xreg[((inst >>> 7) & 0x7) + 8] = (cpu.xreg[((inst >>> 7) & 0x7) + 8] - cpu.xreg[((inst >>> 2) & 0x7) + 8]) >>> 0;
+			return;
+		}
+		if (((inst & 0xfc63) >>> 0) === 0x8c21) { /*c.xor*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			cpu.xreg[((inst >>> 7) & 0x7) + 8] = (cpu.xreg[((inst >>> 7) & 0x7) + 8] ^ cpu.xreg[((inst >>> 2) & 0x7) + 8]) >>> 0;
+			return;
+		}
+		if (((inst & 0xec03) >>> 0) === 0x8401) { /*c.srai*/
+			cpu.pc = (cpu.pc + 2) >>> 0;
+			const imm = (inst >>> 2) & 0x1f;
+			const idx = ((inst >>> 7) & 0x7) + 8;
+			cpu.xreg[idx] = ((cpu.xreg[idx] | 0) >> imm) >>> 0;
+			return;
+		}
+		if (((inst & 0xe003) >>> 0) === 0x2000) { /*c.fld*/
+			const imm = ((inst & 0x1c00) >>> 7) | ((inst & 0x60) << 1);
+			const addr = (cpu.xreg[((inst >>> 7) & 0x7) + 8] + imm) >>> 0;
+			const t = cpu_addr_translate(addr, LOAD_PAGE_FAULT);
+			if (t.ok) {
+				cpu.pc = (cpu.pc + 2) >>> 0;
+				const off = (t.addr - RAM_BASE) >>> 0;
+				cpu.freg[((inst >>> 2) & 0x7) + 8] = ramDV.getBigUint64(off, true);
+			}
+			return;
+		}
+	}
+
+	cpu_take_trap(ILLEGAL_INSTRUCTION, inst);
+}
+
+let hostRef = { exit: () => {} };
+
+// ===== virtqueue field access (direct RAM access, no local staging copy needed since ram is flat) =====
+function qAvailIdx(q) { return memRead16(((q.driver_addr - RAM_BASE) + 2) >>> 0); }
+function qUsedIdx(q) { return memRead16(((q.dev_addr - RAM_BASE) + 2) >>> 0); }
+function qSetUsedIdx(q, v) { memWrite16(((q.dev_addr - RAM_BASE) + 2) >>> 0, v); }
+function qAvailRing(q, i) { return memRead16(((q.driver_addr - RAM_BASE) + 4 + (i % q.num) * 2) >>> 0); }
+function qSetUsedRing(q, i, id, len) {
+	const base = ((q.dev_addr - RAM_BASE) + 4 + (i % q.num) * 8) >>> 0;
+	memWrite32(base, id);
+	memWrite32(base + 4, len);
+}
+function qDesc(q, idx) {
+	const base = ((q.desc_addr - RAM_BASE) + idx * SZ_VIRTQ_DESC) >>> 0;
+	return { addr: memRead32(base), len: memRead32(base + 8), flags: memRead16(base + 12), next: memRead16(base + 14) };
+}
+
+// ===== cpu_loop equivalent: run one batch (matches the C task's per-xSemaphoreTake batch of 46368 instructions) =====
+let traceFn = null;
+function setTraceFn(fn) { traceFn = fn; }
+
+function tickCpu(host) {
+	clint.time = host.now();
+
+	if ((clint.time >>> 0) > (clint.timecmp >>> 0)) csr.sip |= (1 << SUPERVISOR_TIMER_INTERRUPT);
+
+	for (let x = 46368; x--;) {
+
+		const addr = cpu.pc & ~3;
+		const t = cpu_addr_translate(addr >>> 0, INSTRUCTION_PAGE_FAULT);
+
+		if (t.ok) {
+			const off = (t.addr - RAM_BASE) >>> 0;
+			let inst0 = memRead32(off);
+
+			if ((cpu.pc & 2) === 2) {
+				inst0 = inst0 >>> 16;
+				if ((inst0 & 3) === 3) inst0 = (inst0 | (memRead32((off + 4) >>> 0) << 16)) >>> 0;
+			}
+			if (traceFn) traceFn(cpu.pc);
+			cpu_execute(inst0);
+		}
+
+		if (cpu.privilege <= SUPERVISOR && !((csr.sstatus >>> cpu.privilege) & 1)) continue;
+		if (cpu.privilege === MACHINE && !((csr.mstatus >>> MACHINE) & 1)) continue;
+
+		if (csr.sie & csr.sip & (1 << SUPERVISOR_TIMER_INTERRUPT)) {
+			csr.sip &= ~(1 << SUPERVISOR_TIMER_INTERRUPT);
+			cpu_take_trap((SUPERVISOR_TIMER_INTERRUPT | 0x80000000) >>> 0, 0);
+		} else if (csr.sie & csr.sip & (1 << SUPERVISOR_EXTERNAL_INTERRUPT)) {
+			csr.sip &= ~(1 << SUPERVISOR_EXTERNAL_INTERRUPT);
+			cpu_take_trap((SUPERVISOR_EXTERNAL_INTERRUPT | 0x80000000) >>> 0, 0);
+		}
+	}
+}
+
+// ===== virtio_loop equivalent =====
+function tickVirtio(host) {
+
+	if (virtio1_console.queue[1].notify) {
+		const q = virtio1_console.queue[1];
+		q.notify = 0;
+
+		let uidx = qUsedIdx(q);
+		const aidx = qAvailIdx(q);
+		const out = [];
+
+		while (uidx !== aidx) {
+			const ringVal = qAvailRing(q, uidx);
+			const d = qDesc(q, ringVal);
+			const off = (d.addr - RAM_BASE) >>> 0;
+			for (let i = 0; i < d.len; i++) out.push(ram[off + i]);
+			qSetUsedRing(q, uidx, ringVal, d.len);
+			uidx = (uidx + 1) & 0xffff;
+		}
+		qSetUsedIdx(q, uidx);
+		if (out.length) host.consoleWrite(new Uint8Array(out));
+	}
+
+	if (virtio2_blk.queue[0].notify) {
+		const q = virtio2_blk.queue[0];
+		q.notify = 0;
+
+		let uidx = qUsedIdx(q);
+		const aidx = qAvailIdx(q);
+
+		while (uidx !== aidx) {
+			const ringVal = qAvailRing(q, uidx);
+			const d0 = qDesc(q, ringVal);
+			const d1 = qDesc(q, d0.next);
+			const d2 = qDesc(q, d1.next);
+
+			const reqOff = (d0.addr - RAM_BASE) >>> 0;
+			const sectorLo = memRead32((reqOff + 8) >>> 0);
+			const sectorHi = memRead32((reqOff + 12) >>> 0);
+			const rootfsOff = (sectorLo + sectorHi * 4294967296) * 512;
+
+			const memOff = (d1.addr - RAM_BASE) >>> 0;
+			if ((d1.flags & 2) === 0) rootfs.set(ram.subarray(memOff, memOff + d1.len), rootfsOff);
+			else ram.set(rootfs.subarray(rootfsOff, rootfsOff + d1.len), memOff);
+
+			ram[(d2.addr - RAM_BASE) >>> 0] = 0x00; /*VIRTIO_BLK_S_OK*/
+
+			qSetUsedRing(q, uidx, ringVal, d1.len);
+			uidx = (uidx + 1) & 0xffff;
+		}
+		qSetUsedIdx(q, uidx);
+
+		plic.sclaim |= (1 << 0x02);
+		csr.sip |= (1 << SUPERVISOR_EXTERNAL_INTERRUPT);
+		virtio2_blk.int_status |= 1;
+	}
+
+	if (virtio3_gpio.queue[0].notify) {
+		const q = virtio3_gpio.queue[0];
+		q.notify = 0;
+
+		const uidx = qUsedIdx(q);
+		const aidx = qAvailIdx(q);
+		const ringVal = qAvailRing(q, uidx);
+		const d0 = qDesc(q, ringVal);
+		const d1 = qDesc(q, d0.next);
+
+		const reqOff = (d0.addr - RAM_BASE) >>> 0;
+		const reqType = memRead16(reqOff);
+		const reqGpio = memRead16((reqOff + 2) >>> 0);
+		const reqValue = memRead32((reqOff + 4) >>> 0);
+
+		let status = 0x01, value = 0x00; /*VIRTIO_GPIO_STATUS_ERR by default*/
+
+		if (reqGpio <= 1) {
+			if (reqType === 0x004 /*GET_VALUE*/) { value = gpio_level[reqGpio]; status = 0x00; }
+			else if (reqType === 0x005 /*SET_VALUE*/) { gpio_level[reqGpio] = reqValue; status = 0x00; }
+			else if (reqType === 0x002 || reqType === 0x003) status = 0x00; /*GET/SET_DIRECTION: no real GPIO, just ack*/
+		}
+
+		const respOff = (d1.addr - RAM_BASE) >>> 0;
+		ram[respOff] = status;
+		ram[respOff + 1] = value;
+
+		qSetUsedRing(q, uidx, ringVal, 2);
+		qSetUsedIdx(q, (uidx + 1) & 0xffff);
+
+		plic.sclaim |= (1 << 0x03);
+		csr.sip |= (1 << SUPERVISOR_EXTERNAL_INTERRUPT);
+		virtio3_gpio.int_status |= 1;
+	}
+
+	if (virtio8_net.queue[1].notify) {
+		const q = virtio8_net.queue[1];
+		q.notify = 0;
+
+		let uidx = qUsedIdx(q);
+		const aidx = qAvailIdx(q);
+
+		while (uidx !== aidx) {
+			const ringVal = qAvailRing(q, uidx);
+			const d = qDesc(q, ringVal);
+			qSetUsedRing(q, uidx, ringVal, d.len); /*no network backend: packet dropped*/
+			uidx = (uidx + 1) & 0xffff;
+		}
+		qSetUsedIdx(q, uidx);
+	}
+
+	const inBytes = virtio1_console.queue[0].notify ? host.consoleRead() : null;
+	if (inBytes && inBytes.length) {
+		const q = virtio1_console.queue[0];
+		q.notify = 0;
+
+		const uidx = qUsedIdx(q);
+		const aidx = qAvailIdx(q);
+		const ringVal = qAvailRing(q, uidx);
+		const d = qDesc(q, ringVal);
+		const off = (d.addr - RAM_BASE) >>> 0;
+
+		ram.set(inBytes, off);
+
+		qSetUsedRing(q, uidx, ringVal, inBytes.length);
+		qSetUsedIdx(q, (uidx + 1) & 0xffff);
+
+		plic.sclaim |= (1 << 0x01);
+		csr.sip |= (1 << SUPERVISOR_EXTERNAL_INTERRUPT);
+		virtio1_console.int_status |= 1;
+	}
+}
+
+function setFeat64(virtio, bigVal) {
+	virtio.dev_feat[0] = Number(bigVal & 0xffffffffn) >>> 0;
+	virtio.dev_feat[1] = Number((bigVal >> 32n) & 0xffffffffn) >>> 0;
+}
+
+// ===== app_main equivalent =====
+// assets = { bbl32: Uint8Array, image: Uint8Array, dtb: Uint8Array, rootfs: Uint8Array (mutable, in-memory disk) }
+function boot(assets, host) {
+	hostRef = host;
+	rootfs = assets.rootfs;
+
+	csr.misa = ((1 << 0) | (1 << 2) | (1 << 3) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20) | (1 << 30)) >>> 0;
+
+	setFeat64(virtio1_console, 1n << 32n);
+
+	setFeat64(virtio2_blk, 1n << 32n);
+	virtio2_blk.config_space = new Uint8Array(72);
+	new DataView(virtio2_blk.config_space.buffer).setBigUint64(0, BigInt(Math.floor(assets.rootfs.length / 512)), true);
+
+	setFeat64(virtio3_gpio, 1n << 32n);
+	virtio3_gpio.config_space = new Uint8Array(8);
+	new DataView(virtio3_gpio.config_space.buffer).setUint16(0, 2, true); /*ngpio*/
+
+	setFeat64(virtio4_i2c, (1n << 0n) | (1n << 32n));
+
+	setFeat64(virtio8_net, (1n << 3n) | (1n << 5n) | (1n << 32n));
+	virtio8_net.config_space = new Uint8Array(24);
+	virtio8_net.config_space.set([0x02, 0x00, 0x00, 0x00, 0x00, 0x01], 0); /*mac*/
+	new DataView(virtio8_net.config_space.buffer).setUint16(10, 576, true); /*mtu*/
+
+	low.set(assets.dtb.subarray(0, Math.min(4096, assets.dtb.length)));
+
+	ram.set(assets.bbl32, 0x00000000);
+	ram.set(assets.image, 0x00400000);
+}
+
+// ===== browser harness =====
+
+const termEl = document.getElementById('term');
+const statusEl = document.getElementById('status');
+
+function termWrite(text) {
+	termEl.textContent += text;
+	termEl.scrollTop = termEl.scrollHeight;
+}
+
+const decoder = new TextDecoder('utf-8', { fatal: false });
+let pendingByte = null;
+
+const inputQueue = [];
+
+const host = {
+	now: () => performance.now() * 1000 * 240, /*matches the 240MHz clint.time scale used by the original firmware*/
+	consoleWrite: (bytes) => {
+		termWrite(decoder.decode(bytes, { stream: true }));
+	},
+	consoleRead: () => {
+		if (!inputQueue.length) return null;
+		return new Uint8Array(inputQueue.splice(0, 16));
+	},
+	exit: (code) => {
+		statusEl.textContent = 'guest pediu poweroff/reboot (código ' + code + ') — recarregue a página para reiniciar';
+		running = false;
+	},
+};
+
+termEl.addEventListener('keydown', (ev) => {
+	ev.preventDefault();
+	const map = { Enter: 13, Backspace: 127, Tab: 9, Escape: 27 };
+	if (map[ev.key] !== undefined) { inputQueue.push(map[ev.key]); return; }
+	if (ev.ctrlKey && ev.key.length === 1) {
+		const c = ev.key.toUpperCase().charCodeAt(0);
+		if (c >= 65 && c <= 90) { inputQueue.push(c - 64); return; }
+	}
+	if (ev.key.length === 1) {
+		const bytes = new TextEncoder().encode(ev.key);
+		for (const b of bytes) inputQueue.push(b);
+	}
+});
+termEl.addEventListener('click', () => termEl.focus());
+
+document.getElementById('led0');
+function updateGpioLeds() {
+	document.getElementById('led0').classList.toggle('on', !!gpio_level[0]);
+	document.getElementById('led1').classList.toggle('on', !!gpio_level[1]);
+}
+document.getElementById('btn0').addEventListener('click', () => { gpio_level[0] = gpio_level[0] ? 0 : 1; updateGpioLeds(); });
+document.getElementById('btn1').addEventListener('click', () => { gpio_level[1] = gpio_level[1] ? 0 : 1; updateGpioLeds(); });
+document.getElementById('btnReset').addEventListener('click', () => location.reload());
+
+let running = false;
+
+function frame() {
+	if (!running) return;
+	const budget = performance.now() + 12; /*ms per step kept for cpu batches, leaving headroom for rendering*/
+	while (performance.now() < budget) {
+		tickCpu(host);
+		tickVirtio(host);
+	}
+	updateGpioLeds();
+	setTimeout(frame, 0); /*setTimeout instead of requestAnimationFrame: keeps running in background tabs, where rAF gets throttled/paused*/
+}
+
+statusEl.textContent = 'baixando imagens (bbl32, kernel, rootfs, dtb)…';
+
+Promise.all([
+	fetch('data/bbl32.bin').then(r => r.arrayBuffer()),
+	fetch('data/Image').then(r => r.arrayBuffer()),
+	fetch('data/riscv_emulator.dtb').then(r => r.arrayBuffer()),
+	fetch('data/rootfs.ext2').then(r => r.arrayBuffer()),
+]).then(([bbl32, image, dtb, rootfs]) => {
+	const assets = {
+		bbl32: new Uint8Array(bbl32),
+		image: new Uint8Array(image),
+		dtb: new Uint8Array(dtb),
+		rootfs: new Uint8Array(rootfs),
+	};
+
+	boot(assets, host);
+	updateGpioLeds();
+
+	statusEl.textContent = 'rodando — RV32IMAFDC + virtio-mmio (console, blk, gpio)';
+	running = true;
+	termEl.focus();
+	frame();
+}).catch(err => {
+	statusEl.textContent = 'erro ao carregar imagens: ' + err.message;
+});
+</script>
+</body>
+</html>
